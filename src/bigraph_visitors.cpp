@@ -1,4 +1,5 @@
 #include "bigraph_visitors.h"
+#include "asqg.h"
 #include "bigraph_search.h"
 #include "kseq.h"
 #include "reads.h"
@@ -159,6 +160,14 @@ void ContainRemoveVisitor::postvisit(Bigraph* graph) {
 //
 bool FastaVisitor::visit(Bigraph* graph, Vertex* vertex) {
     DNASeq seq(vertex->id(), vertex->seq());
+    const std::string& index = vertex->index();
+    if (!index.empty()) {
+        ASQG::StringTagValue bx(index);
+        if (!seq.comment.empty()) {
+            seq.comment += ' ';
+        }
+        seq.comment += bx.tostring(ASQG::BARCODE_TAG);
+    }
     _stream << seq;
     return false;
 }
@@ -215,7 +224,7 @@ bool LoopRemoveVisitor::visit(Bigraph* graph, Vertex* vertex) {
         Edge* nextEdge = vertex->edges(Edge::ED_SENSE)[0];
         Vertex* prevVert = prevEdge->end();
         Vertex* nextVert = nextEdge->end();
-        if (prevVert == nextVert) {
+        if (!prevEdge->isSelf() && !nextEdge->isSelf() && prevVert == nextVert) {
             //vertex->color(GC_BLACK);
             _loops.push_back(vertex);
             modified = true;
@@ -551,11 +560,10 @@ bool PairedReadVisitor::visit(Bigraph* graph, Vertex* vertex1) {
 
 typedef std::unordered_map<Vertex::Id, BigraphWalk::DistanceAttr> PairedDistanceMap;
 typedef std::unordered_map<Vertex::Id, PairedDistanceMap> PairedLinkList;
-typedef std::unordered_map<Vertex::Id, BigraphWalk::NodePtr> VertexContainmentMap;
 
 class PairedVertexProcess {
 public:
-    PairedVertexProcess(Bigraph* graph, PairedReadVisitor* vistor, const VertexContainmentMap* dict = NULL) : _graph(graph), _visitor(vistor), _dict(dict) {
+    PairedVertexProcess(Bigraph* graph, PairedReadVisitor* vistor) : _graph(graph), _visitor(vistor) {
     }
     BigraphWalk::NodePtrList process(const Vertex* vertex1) {
         BigraphWalk::NodePtrList linklist;
@@ -586,10 +594,7 @@ public:
                 }); // sort by distance
 
         // Match each virtual read with paired vertex1
-        size_t numNodes[Edge::ED_COUNT] = {0}, MAX_STEPS = 3;
         for (const auto& node1 : adjacents) {
-            size_t numIdx = node1->attr.distance >= 0 ? Edge::ED_SENSE : Edge::ED_ANTISENSE; 
-            if (numNodes[numIdx] >= MAX_STEPS) continue;
             const Vertex* paired_v2 = _graph->getVertex(PairEnd::id(node1->vertex->id()));
             assert(paired_v2 != NULL);
             LOG4CXX_DEBUG(logger, boost::format("vertex1: %s<->%s, vertex2: %s<->%s") % vertex1->id() % paired_v1->id() % node1->vertex->id() % paired_v2->id());
@@ -604,7 +609,6 @@ public:
             for (const auto& node2 : faraways) {
                 linklist.push_back(node1);
                 LOG4CXX_DEBUG(logger, boost::format("paired_read_all\t%s\t%s\t%d\t%s\t%s\t%d") % vertex1->id() % node1->vertex->id() % node1->attr.distance % paired_v1->id() % node2->vertex->id() % node2->attr.distance);
-                ++numNodes[numIdx];
                 break;
             }
         }
@@ -614,7 +618,6 @@ public:
 private:
     Bigraph* _graph;
     PairedReadVisitor* _visitor;
-    const VertexContainmentMap* _dict;
 };
 
 class PairedVertexPostProcess {
@@ -757,163 +760,6 @@ private:
     bool _hasColor[Edge::ED_COUNT];
 };
 
-class PairedContainmentVisitor : public BigraphVisitor {
-public:
-    PairedContainmentVisitor(GraphColor white, GraphColor black, VertexContainmentMap& dict) : _white(white), _black(black), _dict(dict) {
-    }
-    void previsit(Bigraph* graph) {
-        graph->color(_white);
-
-        tableInit();
-    }
-    bool visit(Bigraph* graph, Vertex* vertex) {
-        bool modified = false;
-        if (vertex->color() != _black) {
-            BigraphWalk::NodePtrList* containment = new BigraphWalk::NodePtrList();
-            containment->push_back(
-                    BigraphWalk::NodePtr(new BigraphWalk::Node(vertex, 0, Edge::ED_SENSE, Edge::EC_SAME))
-                );
-
-            BigraphWalk::Node* curr = NULL;
-            while ((curr = simplify(graph, vertex, Edge::ED_SENSE))) {
-                containment->push_back(BigraphWalk::NodePtr(curr));
-                modified = true;
-            }
-            BigraphWalk::Node* prev = NULL;
-            while ((curr = simplify(graph, vertex, Edge::ED_ANTISENSE))) {
-                if (prev != NULL) {
-                    curr->attr.distance += prev->attr.distance;
-                }
-                containment->push_back(BigraphWalk::NodePtr(curr));
-                prev = curr;
-                modified = true;
-            }
-
-            // Translate the coordinate
-            std::sort(containment->begin(), containment->end(), [](const BigraphWalk::NodePtr& x, const BigraphWalk::NodePtr& y) -> bool {
-                return x->attr.distance < y->attr.distance;
-            });
-            int distance = (*containment)[0]->attr.distance;
-            for (auto& n : *containment) {
-                // Modify inplace
-                n->attr.distance -= distance;
-                LOG4CXX_INFO(logger, boost::format("PairedContainmentVisitor::visit\t%s\t%s\t%d\t%d\t%d") % vertex->id() % n->vertex->id() % n->attr.distance % n->attr.dir % n->attr.comp);
-            }
-            assert(_table.find(vertex->id()) == _table.end());
-            _table[vertex->id()] = containment;
-        }
-        return modified;
-    }
-    void postvisit(Bigraph* graph) {
-        // graph->sweepVertices(_black);
-        for (auto i = _table.begin(); i != _table.end(); ++i) {
-            for (auto& n : *i->second) {
-                _dict[n->vertex->id()] = n;
-                // Modify inplace
-                n->vertex = graph->getVertex(i->first);
-            }
-        }
-
-        tableClean();
-    }
-private:
-    BigraphWalk::Node* simplify(Bigraph* graph, Vertex* vertex, Edge::Dir dir) {
-        BigraphWalk::Node* merged = NULL;
-
-        // Get the edges for this direction
-        EdgePtrList edges = vertex->edges(dir);
-
-        // If there is a single edge in this direction, merge the vertices
-        // Don't merge singular self edges though
-        if (edges.size() == 1 && !edges[0]->isSelf()) {
-            // Check that the edge back is singular as well
-            Edge* single = edges[0];
-            Edge* twin = single->twin();
-            Vertex* end = single->end();
-            if (end->degrees(twin->dir()) == 1) {
-                int distance = 0;
-                if (dir == Edge::ED_SENSE) {    // forward
-                    const SeqCoord& coord = single->coord();
-                    distance = coord.seqlen - coord.length();
-                } else {                        // backward
-                    const SeqCoord& coord = twin->coord();
-                    distance = -(coord.seqlen - coord.length());
-                }
-                merged = new BigraphWalk::Node(end, distance, single->dir(), single->comp());
-
-                // Eat it
-                graph->merge(vertex, single);
-
-                // It is guarenteed to not be connected
-                end->color(_black);
-            }
-        }
-        return merged;
-    }
-    bool simplify(Bigraph* graph, Vertex* vertex, Edge::Dir dir, BigraphWalk::NodePtrList* containment) {
-        // Get the edges for this direction
-        EdgePtrList edges = vertex->edges(dir);
-
-        // If there is a single edge in this direction, merge the vertices
-        // Don't merge singular self edges though
-        if (edges.size() == 1 && !edges[0]->isSelf()) {
-            // Check that the edge back is singular as well
-            Edge* single = edges[0];
-            Edge* twin = single->twin();
-            Vertex* end = single->end();
-            if (end->degrees(twin->dir()) == 1) {
-                int distance = 0;
-                if (dir == Edge::ED_SENSE) {    // forward
-                    const SeqCoord& coord = single->coord();
-                    distance = coord.seqlen - coord.length();
-                } else {                        // backward
-                    const SeqCoord& coord = twin->coord();
-                    distance = -(coord.seqlen - coord.length());
-                }
-                containment->push_back(
-                        BigraphWalk::NodePtr(new BigraphWalk::Node(end, distance, single->dir(), single->comp()))
-                    );
-
-                // Eat it
-                graph->merge(vertex, single);
-
-                // It is guarenteed to not be connected
-                end->color(_black);
-                return true;
-            }
-        }
-        return false;
-    }
-
-    void tableInit() {
-        tableClean();
-
-        for (auto i = _dict.begin(); i != _dict.end(); ++i) {
-            auto j = _table.find(i->first);
-            if (j != _table.end()) {
-                j->second->push_back(i->second);
-            } else {
-                BigraphWalk::NodePtrList* ptrlist = new BigraphWalk::NodePtrList();
-                ptrlist->push_back(i->second);
-                _table[i->first] = ptrlist;
-            }
-        }
-    }
-
-    void tableClean() {
-        for (auto i = _table.begin(); i != _table.end(); ++i) {
-            delete i->second;
-        } 
-        _table.clear();
-    }
-
-    VertexContainmentMap& _dict;
-    GraphColor _white;
-    GraphColor _black;
-
-    std::unordered_map<Vertex::Id, BigraphWalk::NodePtrList *> _table;
-};
-
 void PairedReadVisitor::postvisit(Bigraph* graph) {
     PairedLinkList links;
 
@@ -1003,13 +849,6 @@ void PairedReadVisitor::postvisit(Bigraph* graph) {
     }
 
     graph->sweepEdges(GC_BLACK);
-
-    //
-    VertexContainmentMap dict;
-    {
-        PairedContainmentVisitor pcVisit(GC_WHITE, GC_BLACK, dict);
-        graph->visit(&pcVisit);
-    }
 }
 
 //

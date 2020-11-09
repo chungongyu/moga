@@ -127,6 +127,16 @@ private:
     friend class PairedVertexPostProcess;
 };
 
+// Visit each node via 10x linked read
+class LinkedReadVisitor : public BigraphVisitor {
+public:
+    LinkedReadVisitor() {
+    }
+    void previsit(Bigraph* graph);
+    bool visit(Bigraph* graph, Vertex* vertex);
+    void postvisit(Bigraph* graph);
+};
+
 // Smooth out variation in the graph
 class SmoothingVisitor : public BigraphVisitor {
 public:

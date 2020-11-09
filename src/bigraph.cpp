@@ -8,6 +8,7 @@
 #include <memory>
 
 #include <boost/format.hpp>
+#include <boost/algorithm/string.hpp>
 
 #include <log4cxx/logger.h>
 
@@ -75,10 +76,40 @@ void Edge::validate() const {
 //
 // Vertex
 //
+Vertex::Vertex(const Id& id, const std::string& seq, bool contained, const std::string& index) : _id(id), _seq(seq), _contained(contained), _color(GC_NONE), _coverage(1) {
+    std::vector<std::string> vec;
+    ASQG::tokenize(vec, index, ',');
+    for (const auto& item : vec) {
+        size_t c = 1;
+        std::string barcode = item;
+        {
+            size_t k = item.rfind('!');
+            if (k != std::string::npos) {
+                barcode = item.substr(0, k);
+                c = std::stoi(item.substr(k + 1));
+            }
+        }
+        auto it = _indexTbl.find(barcode);
+        if (it != _indexTbl.end()) {
+            it->second += c;
+        } else {
+            _indexTbl[barcode] = c;
+        }
+    }
+}
+
 Vertex::~Vertex() {
     for (auto i = _edges.begin(); i != _edges.end(); ++i) {
         delete *i;
     }
+}
+
+std::string Vertex::index() const {
+    std::vector<std::string> vec;
+    for (const auto& it: _indexTbl) {
+        vec.push_back(boost::str(boost::format("%s!%u") % it.first % it.second));
+    }
+    return boost::algorithm::join(vec, ",");
 }
 
 void Vertex::merge(Edge* edge) {
@@ -102,6 +133,16 @@ void Vertex::merge(Edge* edge) {
 
     // Update the coverage value of the vertex
     _coverage += edge->end()->coverage();
+    
+    // Update the index/barcode table of vertex
+    for (const auto& idx : edge->end()->_indexTbl) {
+        auto it = _indexTbl.find(idx.first);
+        if (it != _indexTbl.end()) {
+            it->second += idx.second;
+        } else {
+            _indexTbl[idx.first] = idx.second;
+        }
+    }
 
     ////////////////////////////////////////////////////
     // Extend match
@@ -568,6 +609,10 @@ bool Bigraph::save(std::ostream& stream, const Bigraph* g) {
     // Vertices
     for (auto i = g->_vertices.begin(); i != g->_vertices.end(); ++i) {
         ASQG::VertexRecord record(i->second->id(), i->second->seq());
+        std::string barcode = i->second->index();
+        if (!barcode.empty()) {
+            record.barcode = barcode;
+        }
         stream << record << '\n';
         if (!stream) {
             return false;
